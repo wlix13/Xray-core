@@ -16,10 +16,11 @@ import (
 	"net/netip"
 	"os"
 	"strings"
-	"syscall"
+	"sync"
 	"time"
 
 	"github.com/xtls/xray-core/transport/internet"
+	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/tun"
 
 	"golang.org/x/net/dns/dnsmessage"
@@ -27,7 +28,6 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
-	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
@@ -36,15 +36,157 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
 )
 
+// outboundQueueSize bounds the packets queued for the TUN reader; further ones
+// are dropped like on a full NIC TX ring (wireguard-go uses the same depth).
+const outboundQueueSize = 1024
+
 type netTun struct {
-	ep             *channel.Endpoint
-	stack          *stack.Stack
-	events         chan tun.Event
-	notifyHandle   *channel.NotificationHandle
-	incomingPacket chan *buffer.View
-	mtu            int
-	dnsServers     []netip.Addr
-	hasV4, hasV6   bool
+	ep           *linkEndpoint
+	stack        *stack.Stack
+	events       chan tun.Event
+	mtu          int
+	dnsServers   []netip.Addr
+	hasV4, hasV6 bool
+}
+
+// linkEndpoint queues stack-originated packets for netTun.Read without
+// blocking the stack and injects peer packets straight into the dispatcher.
+type linkEndpoint struct {
+	mtu      uint32
+	outbound chan *stack.PacketBuffer
+
+	mu         sync.RWMutex
+	dispatcher stack.NetworkDispatcher
+	closed     bool
+}
+
+var _ stack.LinkEndpoint = (*linkEndpoint)(nil)
+
+func newLinkEndpoint(mtu uint32) *linkEndpoint {
+	return &linkEndpoint{
+		mtu:      mtu,
+		outbound: make(chan *stack.PacketBuffer, outboundQueueSize),
+	}
+}
+
+func (e *linkEndpoint) MTU() uint32 {
+	return e.mtu
+}
+
+func (e *linkEndpoint) SetMTU(mtu uint32) {
+	e.mtu = mtu
+}
+
+func (e *linkEndpoint) MaxHeaderLength() uint16 {
+	return 0
+}
+
+func (e *linkEndpoint) LinkAddress() tcpip.LinkAddress {
+	return ""
+}
+
+func (e *linkEndpoint) SetLinkAddress(tcpip.LinkAddress) {}
+
+// Everything that reaches the stack has passed WireGuard's AEAD, so inbound
+// checksums need no verification (kernel WireGuard sets CHECKSUM_UNNECESSARY).
+func (e *linkEndpoint) Capabilities() stack.LinkEndpointCapabilities {
+	return stack.CapabilityRXChecksumOffload
+}
+
+func (e *linkEndpoint) Attach(dispatcher stack.NetworkDispatcher) {
+	e.mu.Lock()
+	e.dispatcher = dispatcher
+	e.mu.Unlock()
+}
+
+func (e *linkEndpoint) IsAttached() bool {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.dispatcher != nil
+}
+
+func (e *linkEndpoint) Wait() {}
+
+func (e *linkEndpoint) ARPHardwareType() header.ARPHardwareType {
+	return header.ARPHardwareNone
+}
+
+func (e *linkEndpoint) AddHeader(*stack.PacketBuffer) {}
+
+func (e *linkEndpoint) ParseHeader(*stack.PacketBuffer) bool {
+	return true
+}
+
+func (e *linkEndpoint) SetOnCloseAction(func()) {}
+
+// Close is idempotent: the stack calls it on RemoveNIC and netTun.Close too.
+func (e *linkEndpoint) Close() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closed {
+		return
+	}
+	e.closed = true
+	e.dispatcher = nil
+	close(e.outbound)
+	for pkt := range e.outbound {
+		pkt.DecRef()
+	}
+}
+
+// WritePackets queues for netTun.Read; when the queue is full the rest are
+// dropped without blocking, as channel.Endpoint does.
+func (e *linkEndpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if e.closed {
+		return 0, &tcpip.ErrClosedForSend{}
+	}
+	n := 0
+	for _, pkt := range pkts.AsSlice() {
+		pkt.IncRef()
+		select {
+		case e.outbound <- pkt:
+			n++
+		default:
+			pkt.DecRef()
+			return n, nil
+		}
+	}
+	return n, nil
+}
+
+// inject delivers a packet received from the WireGuard peer to the stack.
+func (e *linkEndpoint) inject(proto tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
+	e.mu.RLock()
+	dispatcher := e.dispatcher
+	e.mu.RUnlock()
+	if dispatcher != nil {
+		dispatcher.DeliverNetworkPacket(proto, pkt)
+	}
+}
+
+// copyPacket copies the whole packet (headers and payload) into dst and
+// returns the number of bytes copied, or 0 if it does not fit.
+func copyPacket(pkt *stack.PacketBuffer, dst []byte) int {
+	if pkt.Size() > len(dst) {
+		return 0
+	}
+	views, offset := pkt.AsViewList()
+	n := 0
+	for v := views.Front(); v != nil; v = v.Next() {
+		s := v.AsSlice()
+		if offset > 0 {
+			if offset >= len(s) {
+				offset -= len(s)
+				continue
+			}
+			s = s[offset:]
+			offset = 0
+		}
+		n += copy(dst[n:], s)
+	}
+	return n
 }
 
 func CreateNetTUN(localAddresses, dnsServers []netip.Addr, mtu int, handleLocal bool) (tun.Device, *Net, *stack.Stack, error) {
@@ -54,17 +196,15 @@ func CreateNetTUN(localAddresses, dnsServers []netip.Addr, mtu int, handleLocal 
 		HandleLocal:        handleLocal,
 	}
 	dev := &netTun{
-		ep:             channel.New(1024, uint32(mtu), ""),
-		stack:          stack.New(opts),
-		events:         make(chan tun.Event, 10),
-		incomingPacket: make(chan *buffer.View),
-		dnsServers:     dnsServers,
-		mtu:            mtu,
+		ep:         newLinkEndpoint(uint32(mtu)),
+		stack:      stack.New(opts),
+		events:     make(chan tun.Event, 10),
+		dnsServers: dnsServers,
+		mtu:        mtu,
 	}
 	if err := configureTCP(dev.stack); err != nil {
 		return nil, nil, nil, err
 	}
-	dev.notifyHandle = dev.ep.AddNotify(dev)
 	tcpipErr := dev.stack.CreateNIC(1, dev.ep)
 	if tcpipErr != nil {
 		return nil, nil, nil, fmt.Errorf("CreateNIC: %v", tcpipErr)
@@ -155,64 +295,61 @@ func (tun *netTun) Events() <-chan tun.Event {
 	return tun.events
 }
 
-func (tun *netTun) Read(buf [][]byte, sizes []int, offset int) (int, error) {
-	view, ok := <-tun.incomingPacket
+// Read blocks for one packet, then drains what else is queued, up to len(bufs).
+func (tun *netTun) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
+	pkt, ok := <-tun.ep.outbound
 	if !ok {
 		return 0, os.ErrClosed
 	}
-
-	n, err := view.Read(buf[0][offset:])
-	if err != nil {
-		return 0, err
+	n := 0
+	for {
+		sizes[n] = copyPacket(pkt, bufs[n][offset:])
+		pkt.DecRef()
+		n++
+		if n == len(bufs) {
+			return n, nil
+		}
+		select {
+		case pkt, ok = <-tun.ep.outbound:
+			if !ok {
+				return n, nil
+			}
+		default:
+			return n, nil
+		}
 	}
-	sizes[0] = n
-	return 1, nil
 }
 
-func (tun *netTun) Write(buf [][]byte, offset int) (int, error) {
-	for _, buf := range buf {
+// Write injects packets received from the WireGuard peer into the stack.
+func (tun *netTun) Write(bufs [][]byte, offset int) (int, error) {
+	for _, buf := range bufs {
 		packet := buf[offset:]
 		if len(packet) == 0 {
 			continue
 		}
-
-		pkb := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buffer.MakeWithData(packet)})
+		var proto tcpip.NetworkProtocolNumber
 		switch packet[0] >> 4 {
 		case 4:
-			tun.ep.InjectInbound(header.IPv4ProtocolNumber, pkb)
+			proto = header.IPv4ProtocolNumber
 		case 6:
-			tun.ep.InjectInbound(header.IPv6ProtocolNumber, pkb)
+			proto = header.IPv6ProtocolNumber
 		default:
-			return 0, syscall.EAFNOSUPPORT
+			continue
 		}
+		pkb := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buffer.MakeWithData(packet)})
+		tun.ep.inject(proto, pkb)
+		pkb.DecRef()
 	}
-	return len(buf), nil
-}
-
-func (tun *netTun) WriteNotify() {
-	pkt := tun.ep.Read()
-	if pkt == nil {
-		return
-	}
-
-	view := pkt.ToView()
-	pkt.DecRef()
-
-	tun.incomingPacket <- view
+	return len(bufs), nil
 }
 
 func (tun *netTun) Close() error {
-	tun.stack.RemoveNIC(1)
+	tun.stack.RemoveNIC(1) // also closes the link endpoint
 	tun.stack.Close()
-	tun.ep.RemoveNotify(tun.notifyHandle)
 	tun.ep.Close()
 
 	if tun.events != nil {
 		close(tun.events)
-	}
-
-	if tun.incomingPacket != nil {
-		close(tun.incomingPacket)
 	}
 
 	return nil
@@ -222,8 +359,9 @@ func (tun *netTun) MTU() (int, error) {
 	return tun.mtu, nil
 }
 
+// BatchSize lets wireguard-go process up to conn.IdealBatchSize packets at once.
 func (tun *netTun) BatchSize() int {
-	return 1
+	return conn.IdealBatchSize
 }
 
 func (tun *netTun) DialContextTCPAddrPort(ctx context.Context, addr netip.AddrPort) (net.Conn, error) {
