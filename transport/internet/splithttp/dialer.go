@@ -215,6 +215,7 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 					default:
 						panic(reflect.TypeOf(c))
 					}
+					internet.TuneUDPConnForQUIC(pktConn)
 
 					return pktConn, nil
 				}
@@ -243,6 +244,10 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 					panic(reflect.TypeOf(c))
 				}
 
+				if len(quicParams.UdpHop.Ports) > 0 || streamSettings.UdpmaskManager != nil {
+					// quic-go cannot tune the socket through the wrappers below.
+					internet.TuneUDPConnForQUIC(pktConn)
+				}
 				if len(quicParams.UdpHop.Ports) > 0 {
 					pktConn = udphop.NewUDPHopPacketConn(udphop.ToAddrs(udpAddr.IP, quicParams.UdpHop.Ports), time.Duration(quicParams.UdpHop.IntervalMin)*time.Second, time.Duration(quicParams.UdpHop.IntervalMax)*time.Second, udpHopDialer, pktConn, index)
 				}

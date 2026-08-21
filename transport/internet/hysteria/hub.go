@@ -323,6 +323,7 @@ func Listen(ctx context.Context, address net.Address, port net.Port, streamSetti
 	}
 
 	if streamSettings.UdpmaskManager != nil {
+		internet.TuneUDPConnForQUIC(pktConn)
 		newConn, err := streamSettings.UdpmaskManager.WrapPacketConnServer(pktConn)
 		if err != nil {
 			pktConn.Close()

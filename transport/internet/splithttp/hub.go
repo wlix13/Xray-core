@@ -481,6 +481,7 @@ func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSet
 			return nil, errors.New("failed to listen UDP for XHTTP/3 on ", address, ":", port).Base(err)
 		}
 		if streamSettings.UdpmaskManager != nil {
+			internet.TuneUDPConnForQUIC(Conn)
 			newConn, err := streamSettings.UdpmaskManager.WrapPacketConnServer(Conn)
 			if err != nil {
 				Conn.Close()

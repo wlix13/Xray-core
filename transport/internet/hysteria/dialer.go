@@ -132,6 +132,7 @@ func (c *client) dial(ctx context.Context) error {
 		default:
 			panic(reflect.TypeOf(c))
 		}
+		internet.TuneUDPConnForQUIC(pktConn)
 
 		return pktConn, nil
 	}
@@ -160,6 +161,10 @@ func (c *client) dial(ctx context.Context) error {
 		panic(reflect.TypeOf(c))
 	}
 
+	if len(quicParams.UdpHop.Ports) > 0 || c.udpmaskManager != nil {
+		// quic-go cannot tune the socket through the wrappers below.
+		internet.TuneUDPConnForQUIC(pktConn)
+	}
 	if len(quicParams.UdpHop.Ports) > 0 {
 		pktConn = udphop.NewUDPHopPacketConn(udphop.ToAddrs(udpAddr.IP, quicParams.UdpHop.Ports), time.Duration(quicParams.UdpHop.IntervalMin)*time.Second, time.Duration(quicParams.UdpHop.IntervalMax)*time.Second, udpHopDialer, pktConn, index)
 	}
