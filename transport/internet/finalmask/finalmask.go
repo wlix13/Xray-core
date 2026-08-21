@@ -39,7 +39,7 @@ func (m *UdpmaskManager) WrapPacketConnClient(raw net.PacketConn) (net.PacketCon
 			conns = append(conns, conn)
 		} else {
 			if len(conns) > 0 {
-				raw = &headerManagerConn{sizes: sizes, conns: conns, PacketConn: raw}
+				raw = newHeaderManagerConn(raw, sizes, conns)
 				sizes = nil
 				conns = nil
 			}
@@ -52,7 +52,7 @@ func (m *UdpmaskManager) WrapPacketConnClient(raw net.PacketConn) (net.PacketCon
 	}
 
 	if len(conns) > 0 {
-		raw = &headerManagerConn{sizes: sizes, conns: conns, PacketConn: raw}
+		raw = newHeaderManagerConn(raw, sizes, conns)
 		sizes = nil
 		conns = nil
 	}
@@ -72,7 +72,7 @@ func (m *UdpmaskManager) WrapPacketConnServer(raw net.PacketConn) (net.PacketCon
 			conns = append(conns, conn)
 		} else {
 			if len(conns) > 0 {
-				raw = &headerManagerConn{sizes: sizes, conns: conns, PacketConn: raw}
+				raw = newHeaderManagerConn(raw, sizes, conns)
 				sizes = nil
 				conns = nil
 			}
@@ -85,7 +85,7 @@ func (m *UdpmaskManager) WrapPacketConnServer(raw net.PacketConn) (net.PacketCon
 	}
 
 	if len(conns) > 0 {
-		raw = &headerManagerConn{sizes: sizes, conns: conns, PacketConn: raw}
+		raw = newHeaderManagerConn(raw, sizes, conns)
 		sizes = nil
 		conns = nil
 	}
@@ -107,8 +107,79 @@ type headerSize interface {
 type headerManagerConn struct {
 	net.PacketConn
 
-	sizes []int
-	conns []net.PacketConn
+	sizes     []int
+	conns     []net.PacketConn
+	expansion int // bytes the masks add to a payload; at least headerSize()
+}
+
+// newHeaderManagerConn wraps raw with the header masks. Over a real UDP socket
+// the wrapper stays out-of-band capable so that quic-go keeps its fast path.
+func newHeaderManagerConn(raw net.PacketConn, sizes []int, conns []net.PacketConn) net.PacketConn {
+	h := &headerManagerConn{PacketConn: raw, sizes: sizes, conns: conns}
+	h.expansion = h.measureExpansion()
+	if oob, ok := raw.(oobPacketConn); ok {
+		return newOOBHeaderManagerConn(h, oob)
+	}
+	return h
+}
+
+func (c *headerManagerConn) headerSize() int {
+	sum := 0
+	for _, size := range c.sizes {
+		sum += size
+	}
+	return sum
+}
+
+// measureExpansion masks a probe: an AEAD mask grows the payload by more than
+// the header it declares.
+func (c *headerManagerConn) measureExpansion() int {
+	probe := make([]byte, 64)
+	n, err := c.mask(probe, make([]byte, UDPSize))
+	if err != nil {
+		return c.headerSize()
+	}
+	return n - len(probe)
+}
+
+var (
+	errMaskShort = errors.New("packet shorter than mask headers")
+	errMaskLarge = errors.New("packet too large for mask")
+	errMaskGSO   = errors.New("mask expansion varies between segments")
+)
+
+// unmask strips the mask layers from a received datagram in place and returns
+// the payload, a sub-slice of b.
+func (c *headerManagerConn) unmask(b []byte) ([]byte, error) {
+	if len(b) < c.headerSize() {
+		return nil, errMaskShort
+	}
+	for i := range c.conns {
+		n, _, err := c.conns[i].ReadFrom(b)
+		if err != nil {
+			return nil, err
+		}
+		b = b[c.sizes[i] : n+c.sizes[i]]
+	}
+	return b, nil
+}
+
+// mask writes the masked form of p into out and returns its length.
+func (c *headerManagerConn) mask(p []byte, out []byte) (int, error) {
+	sum := c.headerSize()
+	if c.expansion+len(p) > len(out) {
+		return 0, errMaskLarge
+	}
+	n := copy(out[sum:], p)
+	for i := len(c.conns) - 1; i >= 0; i-- {
+		var err error
+		n, err = c.conns[i].WriteTo(out[sum-c.sizes[i]:n+sum], nil)
+		if err != nil {
+			return 0, err
+		}
+		sum -= c.sizes[i]
+	}
+	return n, nil
 }
 
 func (c *headerManagerConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
@@ -125,32 +196,12 @@ func (c *headerManagerConn) ReadFrom(p []byte) (n int, addr net.Addr, err error)
 		if err != nil {
 			return n, addr, err
 		}
-		buf := b[:n]
-
-		sum := 0
-		for _, size := range c.sizes {
-			sum += size
-		}
-
-		if n < sum {
-			errors.LogError(context.Background(), "[mask] drop packet from ", addr, " with size ", n)
+		payload, uerr := c.unmask(b[:n])
+		if uerr != nil {
+			errors.LogErrorInner(context.Background(), uerr, "[mask] drop packet from ", addr, " with size ", n)
 			continue
 		}
-
-		for i := range c.conns {
-			n, _, err = c.conns[i].ReadFrom(buf)
-			if err != nil {
-				errors.LogErrorInner(context.Background(), err, "[mask] drop packet from ", addr, " with size ", n)
-				break
-			}
-			buf = buf[c.sizes[i] : n+c.sizes[i]]
-		}
-
-		if err != nil {
-			continue
-		}
-
-		return copy(p, buf), addr, nil
+		return copy(p, payload), addr, nil
 	}
 }
 
@@ -160,37 +211,14 @@ func (c *headerManagerConn) WriteTo(p []byte, addr net.Addr) (n int, err error) 
 	b := buf.Bytes()
 	defer buf.Release()
 
-	sum := 0
-	for _, size := range c.sizes {
-		sum += size
-	}
-
-	if sum+len(p) > UDPSize {
-		errors.LogError(context.Background(), "[mask] drop packet to ", addr, " with size ", len(p))
-		return 0, nil
-	}
-
-	n = copy(b[sum:], p)
-
-	for i := len(c.conns) - 1; i >= 0; i-- {
-		n, err = c.conns[i].WriteTo(b[sum-c.sizes[i]:n+sum], nil)
-		if err != nil {
-			errors.LogErrorInner(context.Background(), err, "[mask] drop packet to ", addr, " with size ", len(p))
-			return 0, nil
-		}
-		sum -= c.sizes[i]
-	}
-
-	if n > UDPSize {
-		errors.LogError(context.Background(), "[mask] drop packet to ", addr, " with size ", len(p))
-		return 0, nil
-	}
-
-	_, err = c.PacketConn.WriteTo(b[:n], addr)
+	n, err = c.mask(p, b)
 	if err != nil {
+		errors.LogErrorInner(context.Background(), err, "[mask] drop packet to ", addr, " with size ", len(p))
+		return 0, nil
+	}
+	if _, err = c.PacketConn.WriteTo(b[:n], addr); err != nil {
 		return 0, err
 	}
-
 	return len(p), nil
 }
 
