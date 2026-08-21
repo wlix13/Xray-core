@@ -85,10 +85,7 @@ func createForwarder(gstack *stack.Stack, handler func(conn net.Conn, dest net.D
 	}
 
 	gstack.SetTransportProtocolHandler(udp.ProtocolNumber, func(id stack.TransportEndpointID, pkt *stack.PacketBuffer) bool {
-		data := pkt.Clone().Data().AsRange().ToSlice()
-		// if len(data) == 0 {
-		// 	return false
-		// }
+		data := pkt.Data().AsRange().ToSlice()
 		srcIP := net.IPAddress(id.RemoteAddress.AsSlice())
 		dstIP := net.IPAddress(id.LocalAddress.AsSlice())
 		if srcIP == nil || dstIP == nil {
@@ -163,12 +160,13 @@ func (m *udpManager) close(uc *udpConn) {
 	}
 }
 
+// writeRawUDPPacket assembles an IP/UDP packet around payload in one View and
+// injects it into the stack.
 func (m *udpManager) writeRawUDPPacket(payload []byte, src net.Destination, dst net.Destination) error {
 	udpLen := header.UDPMinimumSize + len(payload)
 	srcIP := tcpip.AddrFromSlice(src.Address.IP())
 	dstIP := tcpip.AddrFromSlice(dst.Address.IP())
 
-	// build packet with appropriate IP header size
 	isIPv4 := dst.Address.Family().IsIPv4()
 	ipHdrSize := header.IPv6MinimumSize
 	ipProtocol := header.IPv6ProtocolNumber
@@ -177,27 +175,21 @@ func (m *udpManager) writeRawUDPPacket(payload []byte, src net.Destination, dst 
 		ipProtocol = header.IPv4ProtocolNumber
 	}
 
-	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
-		ReserveHeaderBytes: ipHdrSize + header.UDPMinimumSize,
-		Payload:            buffer.MakeWithData(payload),
-	})
-	defer pkt.DecRef()
+	view := buffer.NewViewSize(ipHdrSize + udpLen)
+	pkt := view.AsSlice()
+	copy(pkt[ipHdrSize+header.UDPMinimumSize:], payload)
 
-	// Build UDP header
-	udpHdr := header.UDP(pkt.TransportHeader().Push(header.UDPMinimumSize))
+	udpHdr := header.UDP(pkt[ipHdrSize:])
 	udpHdr.Encode(&header.UDPFields{
 		SrcPort: uint16(src.Port),
 		DstPort: uint16(dst.Port),
 		Length:  uint16(udpLen),
 	})
-
-	// Calculate and set UDP checksum
 	xsum := header.PseudoHeaderChecksum(header.UDPProtocolNumber, srcIP, dstIP, uint16(udpLen))
 	udpHdr.SetChecksum(^udpHdr.CalculateChecksum(checksum.Checksum(payload, xsum)))
 
-	// Build IP header
 	if isIPv4 {
-		ipHdr := header.IPv4(pkt.NetworkHeader().Push(header.IPv4MinimumSize))
+		ipHdr := header.IPv4(pkt[:header.IPv4MinimumSize])
 		ipHdr.Encode(&header.IPv4Fields{
 			TotalLength: uint16(header.IPv4MinimumSize + udpLen),
 			TTL:         64,
@@ -207,7 +199,7 @@ func (m *udpManager) writeRawUDPPacket(payload []byte, src net.Destination, dst 
 		})
 		ipHdr.SetChecksum(^ipHdr.CalculateChecksum())
 	} else {
-		ipHdr := header.IPv6(pkt.NetworkHeader().Push(header.IPv6MinimumSize))
+		ipHdr := header.IPv6(pkt[:header.IPv6MinimumSize])
 		ipHdr.Encode(&header.IPv6Fields{
 			PayloadLength:     uint16(udpLen),
 			TransportProtocol: header.UDPProtocolNumber,
@@ -217,12 +209,9 @@ func (m *udpManager) writeRawUDPPacket(payload []byte, src net.Destination, dst 
 		})
 	}
 
-	// dispatch the packet
-	err := m.stack.WriteRawPacket(1, ipProtocol, buffer.MakeWithView(pkt.ToView()))
-	if err != nil {
+	if err := m.stack.WriteRawPacket(1, ipProtocol, buffer.MakeWithView(view)); err != nil {
 		return errors.New("failed to write raw udp packet back to stack err ", err)
 	}
-
 	return nil
 }
 

@@ -22,12 +22,23 @@ import (
 )
 
 func TestWireguard(t *testing.T) {
+	// TCP and UDP test servers share one port so that a single freedom
+	// destination override on the server side reaches both.
+	testPort := tcp.PickPort()
 	tcpServer := tcp.Server{
+		Port:         testPort,
 		MsgProcessor: xor,
 	}
 	dest, err := tcpServer.Start()
 	common.Must(err)
 	defer tcpServer.Close()
+	udpServer := udp.Server{
+		Port:         testPort,
+		MsgProcessor: xor,
+	}
+	_, err = udpServer.Start()
+	common.Must(err)
+	defer udpServer.Close()
 
 	serverPrivate, _ := conf.ParseWireGuardKey("EGs4lTSJPmgELx6YiJAmPR2meWi6bY+e9rTdCipSj10=")
 	serverPublic, _ := conf.ParseWireGuardKey("MmLJ5iHFVVBp7VsB0hxfpQ0wEzAbT2KQnpQpj0+RtBw=")
@@ -85,6 +96,7 @@ func TestWireguard(t *testing.T) {
 	}
 
 	clientPort := tcp.PickPort()
+	clientUDPPort := udp.PickPort()
 	clientConfig := &core.Config{
 		App: []*serial.TypedMessage{
 			serial.ToTypedMessage(&log.Config{
@@ -102,6 +114,17 @@ func TestWireguard(t *testing.T) {
 					RewriteAddress:  net.NewIPOrDomain(fakeDest.Address),
 					RewritePort:     uint32(fakeDest.Port),
 					AllowedNetworks: []net.Network{net.Network_TCP},
+				}),
+			},
+			{
+				ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
+					PortList: &net.PortList{Range: []*net.PortRange{net.SinglePortRange(clientUDPPort)}},
+					Listen:   net.NewIPOrDomain(net.LocalHostIP),
+				}),
+				ProxySettings: serial.ToTypedMessage(&dokodemo.Config{
+					RewriteAddress:  net.NewIPOrDomain(fakeDest.Address),
+					RewritePort:     uint32(fakeDest.Port),
+					AllowedNetworks: []net.Network{net.Network_UDP},
 				}),
 			},
 		},
@@ -131,6 +154,7 @@ func TestWireguard(t *testing.T) {
 	var errg errgroup.Group
 	for i := 0; i < 10; i++ {
 		errg.Go(testTCPConn(clientPort, 10240, time.Second*20))
+		errg.Go(testUDPConn(clientUDPPort, 1024, time.Second*20))
 	}
 	if err := errg.Wait(); err != nil {
 		t.Error(err)
