@@ -575,6 +575,13 @@ func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSet
 			ReadHeaderTimeout: time.Second * 4,
 			MaxHeaderBytes:    l.config.GetNormalizedServerMaxHeaderBytes(),
 			Protocols:         protocols,
+			HTTP2: &http.HTTP2Config{
+				// A stream-up upload is a single HTTP/2 stream, so the default
+				// 1 MiB windows cap it, and per connection all of a client's
+				// uploads, at 1 MiB per RTT.
+				MaxReceiveBufferPerStream:     4 << 20,
+				MaxReceiveBufferPerConnection: 16 << 20,
+			},
 		}
 		go func() {
 			if err := l.server.Serve(l.listener); err != nil {
