@@ -262,6 +262,7 @@ func (s *Server) Start() error {
 		if err != nil {
 			return nil, err
 		}
+		tuneUDPConn(pktConn)
 		if s.streamSettings.UdpmaskManager != nil {
 			newConn, err := s.streamSettings.UdpmaskManager.WrapPacketConnServer(pktConn)
 			if err != nil {
@@ -270,17 +271,12 @@ func (s *Server) Start() error {
 			}
 			pktConn = newConn
 		}
-		if s.uplinkCounter != nil || s.downlinkCounter != nil {
-			pktConn = &PacketCounterConnection{
-				PacketConn:   pktConn,
-				ReadCounter:  s.uplinkCounter,
-				WriteCounter: s.downlinkCounter,
-			}
-		}
 		return pktConn, nil
 	}
 	bind := &bind{
-		listenFunc: listenFunc,
+		listenFunc:   listenFunc,
+		readCounter:  s.uplinkCounter,
+		writeCounter: s.downlinkCounter,
 	}
 	logger := &device.Logger{
 		Verbosef: func(format string, args ...any) {
