@@ -61,13 +61,11 @@ func CreateNetTUN(localAddresses, dnsServers []netip.Addr, mtu int, handleLocal 
 		dnsServers:     dnsServers,
 		mtu:            mtu,
 	}
-	sackEnabledOpt := tcpip.TCPSACKEnabled(true) // TCP SACK is disabled by default
-	tcpipErr := dev.stack.SetTransportProtocolOption(tcp.ProtocolNumber, &sackEnabledOpt)
-	if tcpipErr != nil {
-		return nil, nil, nil, fmt.Errorf("could not enable TCP SACK: %v", tcpipErr)
+	if err := configureTCP(dev.stack); err != nil {
+		return nil, nil, nil, err
 	}
 	dev.notifyHandle = dev.ep.AddNotify(dev)
-	tcpipErr = dev.stack.CreateNIC(1, dev.ep)
+	tcpipErr := dev.stack.CreateNIC(1, dev.ep)
 	if tcpipErr != nil {
 		return nil, nil, nil, fmt.Errorf("CreateNIC: %v", tcpipErr)
 	}
@@ -109,6 +107,40 @@ func CreateNetTUN(localAddresses, dnsServers []netip.Addr, mtu int, handleLocal 
 
 	dev.events <- tun.EventUp
 	return dev, tnet, dev.stack, nil
+}
+
+const (
+	tcpRecvBufMin     = tcp.MinBufferSize
+	tcpRecvBufDefault = tcp.DefaultReceiveBufferSize // auto-tuned up to tcpRecvBufMax
+	tcpRecvBufMax     = 8 << 20
+	tcpSendBufMin     = tcp.MinBufferSize
+	tcpSendBufDefault = 4 << 20 // not auto-tuned; bounds the fillable BDP
+	tcpSendBufMax     = 8 << 20
+)
+
+// configureTCP mirrors proxy/tun/stack_gvisor.go: cubic, SACK, receive buffer
+// auto-tuning up to 8 MiB, a larger send buffer, RACK/TLP off (#5600).
+func configureTCP(s *stack.Stack) error {
+	cc := tcpip.CongestionControlOption("cubic")
+	sack := tcpip.TCPSACKEnabled(true)
+	moderateRecvBuf := tcpip.TCPModerateReceiveBufferOption(true)
+	recovery := tcpip.TCPRecovery(0)
+	recvBuf := tcpip.TCPReceiveBufferSizeRangeOption{
+		Min:     tcpRecvBufMin,
+		Default: tcpRecvBufDefault,
+		Max:     tcpRecvBufMax,
+	}
+	sendBuf := tcpip.TCPSendBufferSizeRangeOption{
+		Min:     tcpSendBufMin,
+		Default: tcpSendBufDefault,
+		Max:     tcpSendBufMax,
+	}
+	for _, opt := range []tcpip.SettableTransportProtocolOption{&cc, &sack, &moderateRecvBuf, &recovery, &recvBuf, &sendBuf} {
+		if err := s.SetTransportProtocolOption(tcp.ProtocolNumber, opt); err != nil {
+			return fmt.Errorf("could not set TCP option %T: %v", opt, err)
+		}
+	}
+	return nil
 }
 
 func (tun *netTun) Name() (string, error) {
