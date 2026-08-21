@@ -61,7 +61,10 @@ func NewClient(ctx context.Context, conf *DeviceConfig) (*Handler, error) {
 	p := v.GetFeature(policy.ManagerType()).(policy.Manager)
 	d := v.GetFeature(dns.ClientType()).(dns.Client)
 
-	streamSettings := session.StreamSettingsFromContext(ctx).(*internet.MemoryStreamConfig)
+	streamSettings, _ := session.StreamSettingsFromContext(ctx).(*internet.MemoryStreamConfig)
+	if streamSettings == nil {
+		streamSettings = &internet.MemoryStreamConfig{}
+	}
 	tag := session.FullHandlerFromContext(ctx).Tag()
 	var uplinkCounter stats.Counter
 	var downlinkCounter stats.Counter
