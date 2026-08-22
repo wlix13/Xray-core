@@ -26,29 +26,27 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-// TestHysteriaSalamander runs TCP through a Hysteria outbound -> inbound pair
-// whose UDP is wrapped by the salamander mask, which exercises the
-// out-of-band capable mask wrapper that quic-go uses for its fast path.
-func TestHysteriaSalamander(t *testing.T) {
-	tcpServer := tcp.Server{
-		MsgProcessor: xor,
-	}
-	dest, err := tcpServer.Start()
-	common.Must(err)
-	defer tcpServer.Close()
+type hysteriaOptions struct {
+	masks    []*serial.TypedMessage
+	logLevel clog.Severity
+}
 
+// hysteriaConfigs builds a Hysteria inbound forwarding to dest and a client
+// whose dokodemo inbound on clientPort goes through the Hysteria outbound.
+func hysteriaConfigs(dest net.Destination, serverPort, clientPort net.Port, opts hysteriaOptions) (*core.Config, *core.Config) {
 	ct, ctHash := cert.MustGenerate(nil, cert.CommonName("localhost"))
 	const auth = "test-auth"
-	masks := []*serial.TypedMessage{serial.ToTypedMessage(&salamander.Config{Password: "1234"})}
+	logLevel := opts.logLevel
+	if logLevel == clog.Severity_Unknown {
+		logLevel = clog.Severity_Debug
+	}
+	quietLog := serial.ToTypedMessage(&log.Config{
+		ErrorLogLevel: logLevel,
+		ErrorLogType:  log.LogType_Console,
+	})
 
-	serverPort := udp.PickPort()
 	serverConfig := &core.Config{
-		App: []*serial.TypedMessage{
-			serial.ToTypedMessage(&log.Config{
-				ErrorLogLevel: clog.Severity_Debug,
-				ErrorLogType:  log.LogType_Console,
-			}),
-		},
+		App: []*serial.TypedMessage{quietLog},
 		Inbound: []*core.InboundHandlerConfig{
 			{
 				ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
@@ -66,7 +64,7 @@ func TestHysteriaSalamander(t *testing.T) {
 								Certificate: []*tls.Certificate{tls.ParseCertificate(ct)},
 							}),
 						},
-						Udpmasks: masks,
+						Udpmasks: opts.masks,
 					},
 				}),
 				ProxySettings: serial.ToTypedMessage(&hysteria.ServerConfig{
@@ -86,14 +84,8 @@ func TestHysteriaSalamander(t *testing.T) {
 		},
 	}
 
-	clientPort := tcp.PickPort()
 	clientConfig := &core.Config{
-		App: []*serial.TypedMessage{
-			serial.ToTypedMessage(&log.Config{
-				ErrorLogLevel: clog.Severity_Debug,
-				ErrorLogType:  log.LogType_Console,
-			}),
-		},
+		App: []*serial.TypedMessage{quietLog},
 		Inbound: []*core.InboundHandlerConfig{
 			{
 				ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
@@ -122,7 +114,7 @@ func TestHysteriaSalamander(t *testing.T) {
 								PinnedPeerCertSha256: [][]byte{ctHash[:]},
 							}),
 						},
-						Udpmasks: masks,
+						Udpmasks: opts.masks,
 					},
 				}),
 				ProxySettings: serial.ToTypedMessage(&hysteria.ClientConfig{
@@ -134,6 +126,25 @@ func TestHysteriaSalamander(t *testing.T) {
 			},
 		},
 	}
+	return serverConfig, clientConfig
+}
+
+// TestHysteriaSalamander runs TCP through a Hysteria outbound -> inbound pair
+// whose UDP is wrapped by the salamander mask, which exercises the
+// out-of-band capable mask wrapper that quic-go uses for its fast path.
+func TestHysteriaSalamander(t *testing.T) {
+	tcpServer := tcp.Server{
+		MsgProcessor: xor,
+	}
+	dest, err := tcpServer.Start()
+	common.Must(err)
+	defer tcpServer.Close()
+
+	serverPort := udp.PickPort()
+	clientPort := tcp.PickPort()
+	serverConfig, clientConfig := hysteriaConfigs(dest, serverPort, clientPort, hysteriaOptions{
+		masks: []*serial.TypedMessage{serial.ToTypedMessage(&salamander.Config{Password: "1234"})},
+	})
 
 	servers, err := InitializeServerConfigs(serverConfig, clientConfig)
 	common.Must(err)
