@@ -82,9 +82,12 @@ func (b *bind) Open(port uint16) (fns []conn.ReceiveFunc, actualPort uint16, err
 					case <-ch:
 					default:
 						errors.LogErrorInner(context.Background(), err, "unexpected closed")
-						if b.downFunc != nil {
+						b.mu.Lock()
+						down := b.downFunc
+						b.mu.Unlock()
+						if down != nil {
 							go func() {
-								common.Must(b.downFunc())
+								common.Must(down())
 							}()
 						}
 					}
@@ -114,6 +117,14 @@ func (b *bind) received(bufs [][]byte, sizes []int, n int) {
 	if b.readCounter != nil && total > 0 {
 		b.readCounter.Add(total)
 	}
+}
+
+// setDownFunc is called once the device exists, which may already be opening
+// the bind from its TUN event reader.
+func (b *bind) setDownFunc(f func() error) {
+	b.mu.Lock()
+	b.downFunc = f
+	b.mu.Unlock()
 }
 
 func (b *bind) Close() error {

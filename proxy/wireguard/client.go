@@ -321,6 +321,9 @@ func (h *Handler) init(ctx context.Context) error {
 		return pktConn, nil
 	}
 	bind := &bind{
+		resolveFunc:  resolveFunc,
+		listenFunc:   listenFunc,
+		reserved:     h.conf.Reserved,
 		readCounter:  h.downlinkCounter,
 		writeCounter: h.uplinkCounter,
 	}
@@ -339,10 +342,7 @@ func (h *Handler) init(ctx context.Context) error {
 		},
 	}
 	dev := device.NewDevice(h.tun, bind, logger)
-	bind.resolveFunc = resolveFunc
-	bind.listenFunc = listenFunc
-	bind.downFunc = dev.Down
-	bind.reserved = h.conf.Reserved
+	bind.setDownFunc(dev.Down)
 	var cfg strings.Builder
 	cfg.WriteString("private_key=" + h.conf.SecretKey + "\n")
 	for _, peer := range h.conf.Peers {
