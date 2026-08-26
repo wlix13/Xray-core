@@ -21,6 +21,7 @@ import (
 	goreality "github.com/xtls/reality"
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
+	"github.com/xtls/xray-core/common/bytespool"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
 	http_proto "github.com/xtls/xray-core/common/protocol/http"
@@ -421,6 +422,51 @@ func (c *httpServerConn) Write(b []byte) (int, error) {
 		c.ResponseWriter.(http.Flusher).Flush()
 	}
 	return n, err
+}
+
+// coalesceSize bounds a response body write; each one is one DATA frame and
+// a round trip through the HTTP/2 serve loop.
+const coalesceSize = 64 << 10
+
+func (c *httpServerConn) WriteMultiBuffer(mb buf.MultiBuffer) error {
+	defer buf.ReleaseMulti(mb)
+	c.Lock()
+	defer c.Unlock()
+	if c.Done() {
+		return io.ErrClosedPipe
+	}
+	if len(mb) == 1 {
+		if _, err := c.ResponseWriter.Write(mb[0].Bytes()); err != nil {
+			return err
+		}
+		c.ResponseWriter.(http.Flusher).Flush()
+		return nil
+	}
+	staging := bytespool.Alloc(coalesceSize)
+	defer bytespool.Free(staging)
+	n := 0
+	for _, b := range mb {
+		if n+int(b.Len()) > len(staging) && n > 0 {
+			if _, err := c.ResponseWriter.Write(staging[:n]); err != nil {
+				return err
+			}
+			n = 0
+		}
+		if int(b.Len()) > len(staging) {
+			if _, err := c.ResponseWriter.Write(b.Bytes()); err != nil {
+				return err
+			}
+			continue
+		}
+		n += copy(staging[n:], b.Bytes())
+	}
+	if n > 0 {
+		if _, err := c.ResponseWriter.Write(staging[:n]); err != nil {
+			return err
+		}
+	}
+	c.ResponseWriter.(http.Flusher).Flush()
+	return nil
 }
 
 func (c *httpServerConn) Close() error {

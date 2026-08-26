@@ -4,6 +4,8 @@ import (
 	"io"
 	"net"
 	"time"
+
+	"github.com/xtls/xray-core/common/buf"
 )
 
 type splitConn struct {
@@ -16,6 +18,15 @@ type splitConn struct {
 
 func (c *splitConn) Write(b []byte) (int, error) {
 	return c.writer.Write(b)
+}
+
+// WriteMultiBuffer lets the server side write a whole batch as a few large
+// frames; the other writers keep their per-buffer size limits.
+func (c *splitConn) WriteMultiBuffer(mb buf.MultiBuffer) error {
+	if w, ok := c.writer.(*httpServerConn); ok {
+		return w.WriteMultiBuffer(mb)
+	}
+	return (&buf.SequentialWriter{Writer: c.writer}).WriteMultiBuffer(mb)
 }
 
 func (c *splitConn) Read(b []byte) (int, error) {
