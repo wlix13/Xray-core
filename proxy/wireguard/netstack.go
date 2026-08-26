@@ -37,8 +37,9 @@ import (
 )
 
 // outboundQueueSize bounds the packets queued for the TUN reader; further ones
-// are dropped like on a full NIC TX ring (wireguard-go uses the same depth).
-const outboundQueueSize = 1024
+// are dropped like on a full NIC TX ring. GSO lets the TCP sender burst a
+// window at once, so it is deeper than wireguard-go's 1024.
+const outboundQueueSize = 8192
 
 type netTun struct {
 	ep           *linkEndpoint
@@ -60,7 +61,10 @@ type linkEndpoint struct {
 	closed     bool
 }
 
-var _ stack.LinkEndpoint = (*linkEndpoint)(nil)
+var (
+	_ stack.LinkEndpoint = (*linkEndpoint)(nil)
+	_ stack.GSOEndpoint  = (*linkEndpoint)(nil)
+)
 
 func newLinkEndpoint(mtu uint32) *linkEndpoint {
 	return &linkEndpoint{
@@ -91,6 +95,16 @@ func (e *linkEndpoint) SetLinkAddress(tcpip.LinkAddress) {}
 // checksums need no verification (kernel WireGuard sets CHECKSUM_UNNECESSARY).
 func (e *linkEndpoint) Capabilities() stack.LinkEndpointCapabilities {
 	return stack.CapabilityRXChecksumOffload
+}
+
+// The TCP sender builds one segment per write and the stack splits it into
+// MTU-sized packets before they reach WritePackets.
+func (e *linkEndpoint) GSOMaxSize() uint32 {
+	return stack.GVisorGSOMaxSize
+}
+
+func (e *linkEndpoint) SupportedGSO() stack.SupportedGSO {
+	return stack.GVisorGSOSupported
 }
 
 func (e *linkEndpoint) Attach(dispatcher stack.NetworkDispatcher) {
