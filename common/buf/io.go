@@ -111,8 +111,18 @@ func isPacketReader(reader io.Reader) bool {
 // NewReader creates a new Reader.
 // The Reader instance doesn't take the ownership of reader.
 func NewReader(reader io.Reader) Reader {
-	if mr, ok := reader.(Reader); ok {
-		return mr
+	iConn := reader
+	var counter stats.Counter
+	if statConn, ok := reader.(*stat.CounterConnection); ok {
+		iConn = statConn.Connection
+		counter = statConn.ReadCounter
+	}
+
+	if mr, ok := iConn.(Reader); ok {
+		if counter == nil {
+			return mr
+		}
+		return &countedReader{Reader: mr, counter: counter}
 	}
 
 	if isPacketReader(reader) {
@@ -121,20 +131,14 @@ func NewReader(reader io.Reader) Reader {
 		}
 	}
 
-	_, isFile := reader.(*os.File)
+	_, isFile := iConn.(*os.File)
 	if !isFile && useReadV() {
-		if sc, ok := reader.(syscall.Conn); ok {
+		if sc, ok := iConn.(syscall.Conn); ok {
 			rawConn, err := sc.SyscallConn()
 			if err != nil {
 				errors.LogInfoInner(context.Background(), err, "failed to get sysconn")
 			} else {
-				var counter stats.Counter
-
-				if statConn, ok := reader.(*stat.CounterConnection); ok {
-					reader = statConn.Connection
-					counter = statConn.ReadCounter
-				}
-				return NewReadVReader(reader, rawConn, counter)
+				return NewReadVReader(iConn, rawConn, counter)
 			}
 		}
 	}
@@ -142,6 +146,19 @@ func NewReader(reader io.Reader) Reader {
 	return &SingleReader{
 		Reader: reader,
 	}
+}
+
+type countedReader struct {
+	Reader
+	counter stats.Counter
+}
+
+func (r *countedReader) ReadMultiBuffer() (MultiBuffer, error) {
+	mb, err := r.Reader.ReadMultiBuffer()
+	if n := mb.Len(); n > 0 {
+		r.counter.Add(int64(n))
+	}
+	return mb, err
 }
 
 // NewPacketReader creates a new PacketReader based on the given reader.
@@ -169,13 +186,18 @@ func isPacketWriter(writer io.Writer) bool {
 
 // NewWriter creates a new Writer.
 func NewWriter(writer io.Writer) Writer {
-	if mw, ok := writer.(Writer); ok {
-		return mw
-	}
-
 	iConn := writer
+	var counter stats.Counter
 	if statConn, ok := writer.(*stat.CounterConnection); ok {
 		iConn = statConn.Connection
+		counter = statConn.WriteCounter
+	}
+
+	if mw, ok := iConn.(Writer); ok {
+		if counter == nil {
+			return mw
+		}
+		return &countedWriter{Writer: mw, counter: counter}
 	}
 
 	if isPacketWriter(iConn) {
@@ -184,13 +206,24 @@ func NewWriter(writer io.Writer) Writer {
 		}
 	}
 
-	var counter stats.Counter
-
-	if statConn, ok := writer.(*stat.CounterConnection); ok {
-		counter = statConn.WriteCounter
-	}
 	return &BufferToBytesWriter{
 		Writer:  iConn,
 		counter: counter,
 	}
+}
+
+type countedWriter struct {
+	Writer
+	counter stats.Counter
+}
+
+func (w *countedWriter) WriteMultiBuffer(mb MultiBuffer) error {
+	n := mb.Len()
+	if err := w.Writer.WriteMultiBuffer(mb); err != nil {
+		return err
+	}
+	if n > 0 {
+		w.counter.Add(int64(n))
+	}
+	return nil
 }
