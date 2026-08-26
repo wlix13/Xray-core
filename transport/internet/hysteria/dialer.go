@@ -261,6 +261,10 @@ func (c *client) dial(ctx context.Context) error {
 	return nil
 }
 
+// openStreamTimeout bounds the wait for a stream slot when the peer's stream
+// limit is reached.
+const openStreamTimeout = 5 * time.Second
+
 func (c *client) tcp(ctx context.Context) (stat.Connection, error) {
 	c.Lock()
 	defer c.Unlock()
@@ -269,16 +273,21 @@ func (c *client) tcp(ctx context.Context) (stat.Connection, error) {
 	if err != nil {
 		return nil, err
 	}
+	conn := c.conn
+	c.Unlock()
 
-	stream, err := c.conn.OpenStream()
+	ctx, cancel := context.WithTimeout(ctx, openStreamTimeout)
+	defer cancel()
+	stream, err := conn.OpenStreamSync(ctx)
+	c.Lock()
 	if err != nil {
 		return nil, err
 	}
 
 	return &interConn{
 		stream: stream,
-		local:  c.conn.LocalAddr(),
-		remote: c.conn.RemoteAddr(),
+		local:  conn.LocalAddr(),
+		remote: conn.RemoteAddr(),
 
 		client: true,
 	}, nil
