@@ -111,9 +111,9 @@ func (c *client) dial(ctx context.Context) error {
 	if quicParams.MaxIdleTimeout == 0 {
 		quicConfig.MaxIdleTimeout = 30 * time.Second
 	}
-	// if quicParams.KeepAlivePeriod == 0 {
-	// 	quicConfig.KeepAlivePeriod = 10 * time.Second
-	// }
+	if quicParams.KeepAlivePeriod == 0 {
+		quicConfig.KeepAlivePeriod = net.QuicgoH3KeepAlivePeriod
+	}
 
 	udpHopDialer := func(addr *net.UDPAddr) (net.PacketConn, error) {
 		conn, err := internet.DialSystem(ctx, net.UDPDestination(net.IPAddress(addr.IP), net.Port(addr.Port)), c.socketConfig)
