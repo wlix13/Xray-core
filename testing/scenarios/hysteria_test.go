@@ -27,8 +27,10 @@ import (
 )
 
 type hysteriaOptions struct {
-	masks    []*serial.TypedMessage
-	logLevel clog.Severity
+	masks         []*serial.TypedMessage
+	logLevel      clog.Severity
+	clientUDPPort net.Port // adds a UDP dokodemo inbound on the client
+	udpDest       net.Destination
 }
 
 // hysteriaConfigs builds a Hysteria inbound forwarding to dest and a client
@@ -84,21 +86,35 @@ func hysteriaConfigs(dest net.Destination, serverPort, clientPort net.Port, opts
 		},
 	}
 
-	clientConfig := &core.Config{
-		App: []*serial.TypedMessage{quietLog},
-		Inbound: []*core.InboundHandlerConfig{
-			{
-				ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
-					PortList: &net.PortList{Range: []*net.PortRange{net.SinglePortRange(clientPort)}},
-					Listen:   net.NewIPOrDomain(net.LocalHostIP),
-				}),
-				ProxySettings: serial.ToTypedMessage(&dokodemo.Config{
-					RewriteAddress:  net.NewIPOrDomain(dest.Address),
-					RewritePort:     uint32(dest.Port),
-					AllowedNetworks: []net.Network{net.Network_TCP},
-				}),
-			},
+	clientInbounds := []*core.InboundHandlerConfig{
+		{
+			ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
+				PortList: &net.PortList{Range: []*net.PortRange{net.SinglePortRange(clientPort)}},
+				Listen:   net.NewIPOrDomain(net.LocalHostIP),
+			}),
+			ProxySettings: serial.ToTypedMessage(&dokodemo.Config{
+				RewriteAddress:  net.NewIPOrDomain(dest.Address),
+				RewritePort:     uint32(dest.Port),
+				AllowedNetworks: []net.Network{net.Network_TCP},
+			}),
 		},
+	}
+	if opts.clientUDPPort != 0 {
+		clientInbounds = append(clientInbounds, &core.InboundHandlerConfig{
+			ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
+				PortList: &net.PortList{Range: []*net.PortRange{net.SinglePortRange(opts.clientUDPPort)}},
+				Listen:   net.NewIPOrDomain(net.LocalHostIP),
+			}),
+			ProxySettings: serial.ToTypedMessage(&dokodemo.Config{
+				RewriteAddress:  net.NewIPOrDomain(opts.udpDest.Address),
+				RewritePort:     uint32(opts.udpDest.Port),
+				AllowedNetworks: []net.Network{net.Network_UDP},
+			}),
+		})
+	}
+	clientConfig := &core.Config{
+		App:     []*serial.TypedMessage{quietLog},
+		Inbound: clientInbounds,
 		Outbound: []*core.OutboundHandlerConfig{
 			{
 				SenderSettings: serial.ToTypedMessage(&proxyman.SenderConfig{
@@ -140,10 +156,20 @@ func TestHysteriaSalamander(t *testing.T) {
 	common.Must(err)
 	defer tcpServer.Close()
 
+	udpServer := udp.Server{
+		MsgProcessor: xor,
+	}
+	udpDest, err := udpServer.Start()
+	common.Must(err)
+	defer udpServer.Close()
+
 	serverPort := udp.PickPort()
 	clientPort := tcp.PickPort()
+	clientUDPPort := udp.PickPort()
 	serverConfig, clientConfig := hysteriaConfigs(dest, serverPort, clientPort, hysteriaOptions{
-		masks: []*serial.TypedMessage{serial.ToTypedMessage(&salamander.Config{Password: "1234"})},
+		masks:         []*serial.TypedMessage{serial.ToTypedMessage(&salamander.Config{Password: "1234"})},
+		clientUDPPort: clientUDPPort,
+		udpDest:       udpDest,
 	})
 
 	servers, err := InitializeServerConfigs(serverConfig, clientConfig)
@@ -153,6 +179,7 @@ func TestHysteriaSalamander(t *testing.T) {
 	var errg errgroup.Group
 	for i := 0; i < 10; i++ {
 		errg.Go(testTCPConn(clientPort, 1024*1024, time.Second*20))
+		errg.Go(testUDPConn(clientUDPPort, 1024, time.Second*20))
 	}
 	if err := errg.Wait(); err != nil {
 		t.Error(err)

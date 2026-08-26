@@ -232,37 +232,64 @@ type UDPReader struct {
 	reader   io.Reader
 	df       *Defragger
 	firstBuf *buf.Buffer
+
+	buf      []byte
+	lastAddr string
+	lastDest *net.Destination
+}
+
+// destination memoizes the parsed address, which rarely changes between
+// consecutive datagrams of a session.
+func (r *UDPReader) destination(addr []byte) (*net.Destination, error) {
+	if r.lastDest == nil || string(addr) != r.lastAddr {
+		dest, err := net.ParseDestination("udp:" + string(addr))
+		if err != nil {
+			return nil, err
+		}
+		r.lastAddr = string(addr)
+		r.lastDest = &dest
+	}
+	return r.lastDest, nil
 }
 
 func (r *UDPReader) ReadFrom(p []byte) (n int, addr *net.Destination, err error) {
+	if r.buf == nil {
+		r.buf = make([]byte, MaxMessageLength)
+	}
 	for {
-		var buf [hysteria.MaxDatagramFrameSize]byte
-
-		n, err := r.reader.Read(buf[:])
+		n, err := r.reader.Read(r.buf)
 		if err != nil {
 			return 0, nil, err
 		}
 
-		msg, err := ParseUDPMessage(buf[:n])
+		var msg UDPMessage
+		addrBytes, err := parseUDPMessage(r.buf[:n], &msg)
+		if err != nil {
+			continue
+		}
+		dest, err := r.destination(addrBytes)
 		if err != nil {
 			continue
 		}
 
-		dfMsg := r.df.Feed(msg)
-		if dfMsg == nil {
+		data := msg.Data
+		if msg.FragCount > 1 {
+			// The defragger keeps fragments, so they must not alias r.buf.
+			frag := msg
+			frag.Addr = r.lastAddr
+			frag.Data = append([]byte(nil), msg.Data...)
+			whole := r.df.Feed(&frag)
+			if whole == nil {
+				continue
+			}
+			data = whole.Data
+		}
+
+		if len(p) < len(data) {
 			continue
 		}
 
-		dest, err := net.ParseDestination("udp:" + dfMsg.Addr)
-		if err != nil {
-			continue
-		}
-
-		if len(p) < len(dfMsg.Data) {
-			continue
-		}
-
-		return copy(p, dfMsg.Data), &dest, nil
+		return copy(p, data), dest, nil
 	}
 }
 
